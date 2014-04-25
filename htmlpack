@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+# Copyright (c) 2014 Alexander Schmolck <alexander@lshift.net>
+# Copyright (c) 2014 LShift Ltd. <query@lshift.net>
+# See LICENSE.txt
+"""Convert an url or file to a single self-contained html file, with all images
+etc. inlined as data urls.
+"""
+import argparse
+import hashlib
+import os.path
+import sys
+import urllib
+import urlparse
+
+from lxml import html, etree
+from requests import Session
+from requests_file.adapters import FileAdapter
+
+session = Session() # pylint: disable=C0103
+session.mount('file://', FileAdapter())
+
+def url_attr(tag):
+    return 'src' if tag == 'img' else 'href'
+
+def e_url(e):
+    return e.attrib.get(url_attr(e.tag), '')
+
+def save_old_url(e, old_url):
+    e.attrib['data-orig-href'] = old_url
+
+def update_e_url(e, new_url):
+    e.attrib[url_attr(e.tag)] = new_url
+    save_old_url(e, e_url(e))
+
+def to_data_url(data, mimetype):
+    return 'data:%s;base64,%s' % (
+        mimetype,
+        data.encode('base64').replace('\n', ''))
+
+TO_INLINE = 'img, source, link[rel="stylesheet"], script[src]'
+def handle_transcludes(abs_url, tree):
+    # FIXME <base>
+    transcludes = tree.cssselect(TO_INLINE)
+    for trans in transcludes:
+        url = e_url(trans)
+        if not url.startswith('data:'):
+            dl = session.get(abs_url(url))
+            data, mime = dl.content, dl.headers['content-type']
+            if mime == 'text/css' or trans.tag == 'script':
+                trans.attrib.clear()
+                trans[:] = []
+                trans.text = data.decode(dl.encoding or 'utf-8')
+                if trans.tag != 'script':
+                    trans.tag = 'style'
+                save_old_url(trans, url)
+            else:
+                update_e_url(trans, to_data_url(data, mime))
+
+def nuke_bad_stuff(tree):
+    for bad in tree.cssselect('script'):
+        bad.getparent().remove(bad)
+
+def path2url(path):
+    return urlparse.urljoin('file:', urllib.pathname2url(
+        os.path.abspath(path)))
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    arg = parser.add_argument
+    arg("url", help='The url (or file) to the html source')
+    arg("outfile", nargs='?', default=sys.stdout, type=argparse.FileType('w'),
+        help='The name of the output html file (default: stdout)')
+    args = parser.parse_args()
+    url =  args.url
+    if '://' not in url:
+        url = path2url(url)
+    page = session.get(url)
+    tree = html.fromstring(page.text)
+    nuke_bad_stuff(tree)
+    def abs_url(rel_url):
+        return urlparse.urljoin(url, rel_url)
+    handle_transcludes(abs_url, tree)
+    s = html.tostring(tree, doctype='<!DOCTYPE html>')
+    args.outfile.write(s)
+    args.outfile.flush()
+
+if __name__ == '__main__':
+    main()
